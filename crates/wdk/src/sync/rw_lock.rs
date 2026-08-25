@@ -204,14 +204,20 @@ impl<T: ?Sized> Drop for RwLock<T> {
     fn drop(&mut self) {
         // SAFETY: The resource was initialized by `try_new`, is owned by this
         // `RwLock`, and no guards can outlive `self`.
-        unsafe {
-            let _ = ExDeleteResourceLite(self.resource.as_ptr());
-        }
+        let status = unsafe { ExDeleteResourceLite(self.resource.as_ptr()) };
 
-        // SAFETY: `self.resource` was allocated by `allocate_resource` and has
-        // not already been deallocated.
-        unsafe {
-            deallocate_resource(self.resource);
+        // Only free the backing allocation if the kernel successfully tore down
+        // the resource. If teardown fails (e.g. `STATUS_RESOURCE_IN_USE`),
+        // freeing here risks a use-after-free inside the kernel, so we
+        // intentionally leak the allocation instead.
+        if nt_success(status) {
+            // SAFETY: `self.resource` was allocated by `allocate_resource` and has
+            // not already been deallocated.
+            unsafe {
+                deallocate_resource(self.resource);
+            }
+        } else {
+            debug_assert!(nt_success(status));
         }
     }
 }
