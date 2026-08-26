@@ -216,8 +216,6 @@ impl<T: ?Sized> Drop for RwLock<T> {
             unsafe {
                 deallocate_resource(self.resource);
             }
-        } else {
-            debug_assert!(nt_success(status));
         }
     }
 }
