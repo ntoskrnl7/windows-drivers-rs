@@ -10,7 +10,7 @@
 use std::{
     ffi::{CStr, CString},
     marker::PhantomData,
-    ops::RangeFrom,
+    ops::RangeInclusive,
     path::{Path, PathBuf},
     result::Result,
 };
@@ -30,25 +30,52 @@ use windows::{
 use crate::providers::{exec::CommandExec, fs::Fs, wdk_build::WdkBuild};
 use crate::{actions::build::error::PackageTaskError, providers::error::FileError};
 
+// InfVerif in WDK builds in this range is buggy and does not contain the
+// /samples flag.
+const MISSING_SAMPLE_FLAG_WDK_BUILD_NUMBER_RANGE: RangeInclusive<u32> = 25798..=26100;
+const WDR_TEST_CERT_STORE: &str = "WDRTestCertStore";
+const WDR_LOCAL_TEST_CERT: &str = "WDRLocalTestCert";
+const STAMPINF_VERSION_ENV_VAR: &str = "STAMPINF_VERSION";
+const DEFAULT_TIMESTAMP_URL: &str = "http://timestamp.digicert.com";
+
 /// Signing mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SignMode {
     /// Skip signing entirely.
     Off,
-    /// Sign with an auto-generated self-signed certificate.
+    /// Test-sign the driver artifacts.
     Test {
         /// When `true`, run `signtool verify` on the signed driver binary and
         /// catalog file after signing.
         verify_signature: bool,
+        /// Additional `signtool sign` arguments.
+        ///
+        /// When empty, run `signtool sign` with the auto-generated WDR test
+        /// certificate and default switches. When non-empty, auto generation
+        /// is skipped and the caller owns the full signtool command line
+        /// (certificate selection, digest, etc.).
+        signtool_args: Vec<String>,
     },
 }
 
-// FIXME: This range is inclusive of 25798. Update with range end after /sample
-// flag is added to InfVerif CLI
-const MISSING_SAMPLE_FLAG_WDK_BUILD_NUMBER_RANGE: RangeFrom<u32> = 25798..;
-const WDR_TEST_CERT_STORE: &str = "WDRTestCertStore";
-const WDR_LOCAL_TEST_CERT: &str = "WDRLocalTestCert";
-const STAMPINF_VERSION_ENV_VAR: &str = "STAMPINF_VERSION";
+/// Platform at which the device driver is targeted. See <https://learn.microsoft.com/en-us/windows-hardware/drivers/develop/target-platforms>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetPlatform {
+    Universal,
+    Desktop,
+    Windows,
+}
+
+impl TargetPlatform {
+    /// Returns the `InfVerif` mode flag for this target platform.
+    const fn as_infverif_flag(self) -> &'static str {
+        match self {
+            Self::Universal => "/u",
+            Self::Desktop => "/h",
+            Self::Windows => "/w",
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct PackageTaskParams<'a> {
@@ -57,14 +84,17 @@ pub struct PackageTaskParams<'a> {
     pub target_dir: &'a Path,
     pub target_arch: &'a CpuArchitecture,
     pub sign_mode: SignMode,
+    pub inf2cat_args: Option<Vec<String>>,
     pub sample_class: bool,
     pub driver_model: DriverConfig,
+    pub target_platform: TargetPlatform,
 }
 
 /// Supports low level driver packaging operations
 pub struct PackageTask<'a> {
     package_name: String,
     sign_mode: SignMode,
+    inf2cat_args: Option<Vec<String>>,
     sample_class: bool,
 
     // src paths
@@ -87,6 +117,7 @@ pub struct PackageTask<'a> {
     arch: &'a CpuArchitecture,
     os_mapping: &'a str,
     driver_model: DriverConfig,
+    target_platform: TargetPlatform,
 
     // Injected deps
     wdk_build: &'a WdkBuild,
@@ -175,6 +206,7 @@ impl<'a> PackageTask<'a> {
         Self {
             package_name,
             sign_mode: params.sign_mode,
+            inf2cat_args: params.inf2cat_args,
             sample_class: params.sample_class,
             src_inx_file_path,
             src_driver_binary_file_path,
@@ -192,6 +224,7 @@ impl<'a> PackageTask<'a> {
             arch: params.target_arch,
             os_mapping,
             driver_model: params.driver_model,
+            target_platform: params.target_platform,
             wdk_build,
             command_exec,
             fs,
@@ -209,8 +242,8 @@ impl<'a> PackageTask<'a> {
     ///   error generating a certificate in the store.
     /// * `PackageTaskError::CreateCertFileFromStoreCommand` - If there is an
     ///   error creating a certificate file from the store.
-    /// * `PackageTaskError::DriverBinarySignCommand` - If there is an error
-    ///   signing the driver binary.
+    /// * `PackageTaskError::SigntoolSignCommand` - If there is an error signing
+    ///   the driver binary or catalog file.
     /// * `PackageTaskError::DriverBinarySignVerificationCommand` - If there is
     ///   an error verifying the driver binary signature.
     /// * `PackageTaskError::Inf2CatCommand` - If there is an error running the
@@ -231,12 +264,14 @@ impl<'a> PackageTask<'a> {
     /// * `PackageTaskError::Io` - Wraps all possible IO errors.
     pub fn run(&self) -> Result<(), PackageTaskError> {
         self.check_inx_exists()?;
-        debug!("Creating final package directory if it doesn't exist");
-        if !self.fs.exists(&self.dest_root_package_folder) {
-            self.fs.create_dir(&self.dest_root_package_folder)?;
+        if self.fs.exists(&self.dest_root_package_folder) {
+            debug!("Removing existing package folder");
+            self.fs.remove_dir_all(&self.dest_root_package_folder)?;
         }
+        debug!("Creating package folder");
+        self.fs.create_dir(&self.dest_root_package_folder)?;
         info!(
-            "Copying files to target package folder: {}",
+            "Copying files to package folder: {}",
             self.dest_root_package_folder.to_string_lossy()
         );
         self.rename_driver_binary_extension()?;
@@ -254,34 +289,42 @@ impl<'a> PackageTask<'a> {
         Ok(())
     }
 
-    /// Signs the driver binary and catalog file according to `self.sign_mode`
-    /// and optionally verifies the resulting signatures. Returns a variant of
-    /// `PackageTaskError` if any step of the process fails.
     fn sign_and_verify(&self) -> Result<(), PackageTaskError> {
-        let SignMode::Test { verify_signature } = self.sign_mode else {
+        let SignMode::Test {
+            verify_signature,
+            signtool_args,
+        } = &self.sign_mode
+        else {
             info!("Sign mode is 'off'; skipping signing");
             return Ok(());
         };
-
-        self.generate_certificate()?;
-        self.copy(&self.src_cert_file_path, &self.dest_cert_file_path)?;
-        self.run_signtool_sign(
-            &self.dest_driver_binary_path,
-            WDR_TEST_CERT_STORE,
-            WDR_LOCAL_TEST_CERT,
-        )?;
-        self.run_signtool_sign(
-            &self.dest_cat_file_path,
-            WDR_TEST_CERT_STORE,
-            WDR_LOCAL_TEST_CERT,
-        )?;
-
-        if verify_signature {
+        let sign_args = if signtool_args.is_empty() {
+            self.generate_certificate()?;
+            self.copy(&self.src_cert_file_path, &self.dest_cert_file_path)?;
+            // Default WDR test-cert switches.
+            [
+                "/v",
+                "/s",
+                WDR_TEST_CERT_STORE,
+                "/n",
+                WDR_LOCAL_TEST_CERT,
+                "/t",
+                DEFAULT_TIMESTAMP_URL,
+                "/fd",
+                "SHA256",
+            ]
+            .map(ToString::to_string)
+            .to_vec()
+        } else {
+            signtool_args.clone()
+        };
+        self.run_signtool_sign(&self.dest_driver_binary_path, &sign_args)?;
+        self.run_signtool_sign(&self.dest_cat_file_path, &sign_args)?;
+        if *verify_signature {
             info!("Verifying signatures for driver binary and cat file using signtool");
             self.run_signtool_verify(&self.dest_driver_binary_path)?;
             self.run_signtool_verify(&self.dest_cat_file_path)?;
         }
-
         Ok(())
     }
 
@@ -378,18 +421,25 @@ impl<'a> PackageTask<'a> {
 
     fn run_inf2cat(&self) -> Result<(), PackageTaskError> {
         info!("Running inf2cat");
-        let args = [
-            &format!(
-                "/driver:{}",
-                self.dest_root_package_folder
-                    .to_string_lossy()
-                    .trim_start_matches("\\\\?\\")
-            ),
-            &format!("/os:{}", self.os_mapping),
-            "/uselocaltime",
-        ];
+        let driver_arg = format!(
+            "/driver:{}",
+            self.dest_root_package_folder
+                .to_string_lossy()
+                .trim_start_matches("\\\\?\\")
+        );
 
-        if let Err(e) = self.command_exec.run("inf2cat", &args, None, None) {
+        let mut args: Vec<String> = vec![driver_arg];
+        if let Some(inf2cat_args) = &self.inf2cat_args {
+            args.extend(inf2cat_args.iter().cloned());
+        } else {
+            args.extend([
+                format!("/os:{}", self.os_mapping),
+                "/uselocaltime".to_string(),
+            ]);
+        }
+
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        if let Err(e) = self.command_exec.run("inf2cat", &arg_refs, None, None) {
             return Err(PackageTaskError::Inf2CatCommand(e));
         }
 
@@ -481,20 +531,21 @@ impl<'a> PackageTask<'a> {
         Ok(())
     }
 
-    /// Signs the specified file using signtool command using certificate from
-    /// certificate store.
+    /// Signs the file with `signtool` by executing the following command:
+    /// `sign <signtool_args...> <file_path>`
     ///
     /// # Arguments
     ///
     /// * `file_path` - The path to the file to be signed.
-    /// * `cert_store` - The certificate store to use for signing.
-    /// * `cert_name` - The name of the certificate to use for signing. TODO:
-    ///   Add parameters for certificate store and name
+    /// * `signtool_args` - The full `signtool sign` argument list to use.
+    ///
+    /// # Errors
+    /// * `PackageTaskError::SigntoolSignCommand` - If there is an error signing
+    ///   the file with `signtool`.
     fn run_signtool_sign(
         &self,
         file_path: &Path,
-        cert_store: &str,
-        cert_name: &str,
+        signtool_args: &[String],
     ) -> Result<(), PackageTaskError> {
         info!(
             "Signing {} using signtool",
@@ -503,22 +554,41 @@ impl<'a> PackageTask<'a> {
                 .expect("Unable to read file name from the path")
                 .to_string_lossy()
         );
-        let driver_binary_file_path = file_path.to_string_lossy();
-        let args = [
-            "sign",
-            "/v",
-            "/s",
-            cert_store,
-            "/n",
-            cert_name,
-            "/t",
-            "http://timestamp.digicert.com",
-            "/fd",
-            "SHA256",
-            &driver_binary_file_path,
-        ];
-        if let Err(e) = self.command_exec.run("signtool", &args, None, None) {
-            return Err(PackageTaskError::DriverBinarySignCommand(e));
+        let file_path_buf = file_path.to_path_buf();
+        let file_path = file_path.to_string_lossy().into_owned();
+
+        let mut args: Vec<String> = vec!["sign".to_string()];
+        args.extend(signtool_args.iter().cloned());
+        // File operand (must be last).
+        args.push(file_path);
+
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+
+        // Determine the indices of password values (the token right after each
+        // `/p`) so they can be redacted by `run_with_redaction` in the logs.
+        // `value_index < file_operand_index` ensures a value token
+        // actually follows `/p` and that it is never the trailing file operand.
+        let file_operand_index = arg_refs.len() - 1;
+        let redaction_indices: Vec<usize> = arg_refs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, arg)| {
+                let value_index = i + 1;
+                (arg.eq_ignore_ascii_case("/p") && value_index < file_operand_index)
+                    .then_some(value_index)
+            })
+            .collect();
+        if let Err(e) = self.command_exec.run_with_redaction(
+            "signtool",
+            &arg_refs,
+            &redaction_indices,
+            None,
+            None,
+        ) {
+            return Err(PackageTaskError::SigntoolSignCommand {
+                file: file_path_buf,
+                source: e,
+            });
         }
         Ok(())
     }
@@ -544,29 +614,28 @@ impl<'a> PackageTask<'a> {
     fn run_infverif(&self) -> Result<(), PackageTaskError> {
         let additional_args = if self.sample_class {
             let wdk_build_number = self.wdk_build.detect_wdk_build_number()?;
-            if MISSING_SAMPLE_FLAG_WDK_BUILD_NUMBER_RANGE.contains(&wdk_build_number) {
-                debug!(
-                    "InfVerif in WDK Build {wdk_build_number} is bugged and does not contain the \
-                     /samples flag."
-                );
-                warn!("InfVerif skipped for samples class. WDK Build: {wdk_build_number}");
-                return Ok(());
+            match wdk_build_number {
+                n if MISSING_SAMPLE_FLAG_WDK_BUILD_NUMBER_RANGE.contains(&n) => {
+                    debug!(
+                        "InfVerif in WDK Build {wdk_build_number} is buggy and does not contain \
+                         the /samples flag."
+                    );
+                    warn!("InfVerif skipped for samples class. WDK Build: {wdk_build_number}");
+                    return Ok(());
+                }
+                // Use the `/samples` flag after the range and the `/msft` flag before the range
+                n if n > *MISSING_SAMPLE_FLAG_WDK_BUILD_NUMBER_RANGE.end() => "/samples",
+                _ => "/msft",
             }
-            "/msft"
         } else {
             ""
         };
 
         info!("Running infverif");
-        let mut args = vec![
-            "/v",
-            match self.driver_model {
-                DriverConfig::Kmdf(_) | DriverConfig::Wdm => "/w",
-                // TODO: This should be /u if WDK <= GE && DRIVER_MODEL == UMDF, otherwise it should
-                // be /w
-                DriverConfig::Umdf(_) => "/u",
-            },
-        ];
+
+        let mode_flag = self.target_platform.as_infverif_flag();
+
+        let mut args = vec!["/v", mode_flag];
         let inf_path = self.dest_inf_file_path.to_string_lossy();
 
         if self.sample_class {
@@ -644,7 +713,7 @@ mod tests {
         process::{ExitStatus, Output},
     };
 
-    use wdk_build::{CpuArchitecture, KmdfConfig};
+    use wdk_build::{CpuArchitecture, KmdfConfig, UmdfConfig};
 
     use super::*;
 
@@ -664,7 +733,10 @@ mod tests {
             sample_class: false,
             sign_mode: SignMode::Test {
                 verify_signature: false,
+                signtool_args: Vec::new(),
             },
+            inf2cat_args: None,
+            target_platform: TargetPlatform::Universal,
         };
         let dest_root = target_dir.join(format!("{package_name}_package"));
 
@@ -677,6 +749,7 @@ mod tests {
             task.sign_mode,
             SignMode::Test {
                 verify_signature: false,
+                signtool_args: Vec::new(),
             }
         );
         assert!(!task.sample_class);
@@ -734,7 +807,10 @@ mod tests {
             sample_class: false,
             sign_mode: SignMode::Test {
                 verify_signature: false,
+                signtool_args: Vec::new(),
             },
+            inf2cat_args: None,
+            target_platform: TargetPlatform::Universal,
         };
 
         let command_exec = CommandExec::default();
@@ -762,7 +838,10 @@ mod tests {
             sample_class: false,
             sign_mode: SignMode::Test {
                 verify_signature: false,
+                signtool_args: Vec::new(),
             },
+            inf2cat_args: None,
+            target_platform: TargetPlatform::Universal,
         };
 
         let command_exec = CommandExec::default();
@@ -799,7 +878,10 @@ mod tests {
                         sample_class: false,
                         sign_mode: SignMode::Test {
                             verify_signature: false,
+                            signtool_args: Vec::new(),
                         },
+                        inf2cat_args: None,
+                        target_platform: TargetPlatform::Universal,
                     };
 
                     let wdk_build = WdkBuild::default();
@@ -837,6 +919,457 @@ mod tests {
                 "scenario {name} failed (env_set={env_val:?})"
             );
         }
+    }
+
+    #[test]
+    fn run_inf2cat_with_no_args_uses_arch_os_and_uselocaltime() {
+        let working_dir = PathBuf::from("C:/abs/driver");
+        let target_dir = PathBuf::from("C:/abs/driver/target/debug");
+        let arch = CpuArchitecture::Amd64;
+
+        let params = PackageTaskParams {
+            package_name: "driver",
+            working_dir: &working_dir,
+            target_dir: &target_dir,
+            target_arch: &arch,
+            driver_model: DriverConfig::Kmdf(KmdfConfig::default()),
+            sample_class: false,
+            sign_mode: SignMode::Test {
+                verify_signature: false,
+                signtool_args: Vec::new(),
+            },
+            inf2cat_args: None,
+            target_platform: TargetPlatform::Universal,
+        };
+
+        let wdk_build = WdkBuild::default();
+        let fs = Fs::default();
+        let mut command_exec = CommandExec::default();
+        command_exec
+            .expect_run()
+            .withf(move |cmd: &str, args: &[&str], _, _| {
+                cmd == "inf2cat"
+                    && args[0].starts_with("/driver:")
+                    && args.contains(&"/os:10_x64")
+                    && args.contains(&"/uselocaltime")
+            })
+            .once()
+            .return_once(|_, _, _, _| {
+                Ok(Output {
+                    status: ExitStatus::default(),
+                    stdout: vec![],
+                    stderr: vec![],
+                })
+            });
+
+        let task = PackageTask::new(params, &wdk_build, &command_exec, &fs);
+        assert!(task.run_inf2cat().is_ok());
+    }
+
+    #[test]
+    fn run_inf2cat_with_empty_custom_args_passes_only_driver_arg() {
+        let working_dir = PathBuf::from("C:/abs/driver");
+        let target_dir = PathBuf::from("C:/abs/driver/target/debug");
+        let arch = CpuArchitecture::Amd64;
+
+        let params = PackageTaskParams {
+            package_name: "driver",
+            working_dir: &working_dir,
+            target_dir: &target_dir,
+            target_arch: &arch,
+            driver_model: DriverConfig::Kmdf(KmdfConfig::default()),
+            sample_class: false,
+            sign_mode: SignMode::Test {
+                verify_signature: false,
+                signtool_args: Vec::new(),
+            },
+            inf2cat_args: Some(Vec::new()),
+            target_platform: TargetPlatform::Universal,
+        };
+
+        let wdk_build = WdkBuild::default();
+        let fs = Fs::default();
+        let mut command_exec = CommandExec::default();
+        command_exec
+            .expect_run()
+            .withf(move |cmd: &str, args: &[&str], _, _| {
+                cmd == "inf2cat" && args.len() == 1 && args[0].starts_with("/driver:")
+            })
+            .once()
+            .return_once(|_, _, _, _| {
+                Ok(Output {
+                    status: ExitStatus::default(),
+                    stdout: vec![],
+                    stderr: vec![],
+                })
+            });
+
+        let task = PackageTask::new(params, &wdk_build, &command_exec, &fs);
+        assert!(task.run_inf2cat().is_ok());
+    }
+
+    #[test]
+    fn run_inf2cat_with_custom_args_forwards_them_verbatim() {
+        let working_dir = PathBuf::from("C:/abs/driver");
+        let target_dir = PathBuf::from("C:/abs/driver/target/debug");
+        let arch = CpuArchitecture::Amd64;
+
+        let params = PackageTaskParams {
+            package_name: "driver",
+            working_dir: &working_dir,
+            target_dir: &target_dir,
+            target_arch: &arch,
+            driver_model: DriverConfig::Kmdf(KmdfConfig::default()),
+            sample_class: false,
+            sign_mode: SignMode::Test {
+                verify_signature: false,
+                signtool_args: Vec::new(),
+            },
+            inf2cat_args: Some(vec![
+                "/os:10_x64,10_CO_X64".to_string(),
+                "/verbose".to_string(),
+            ]),
+            target_platform: TargetPlatform::Universal,
+        };
+
+        let wdk_build = WdkBuild::default();
+        let fs = Fs::default();
+        let mut command_exec = CommandExec::default();
+        command_exec
+            .expect_run()
+            .withf(move |cmd: &str, args: &[&str], _, _| {
+                cmd == "inf2cat"
+                    && args[0].starts_with("/driver:")
+                    && args.contains(&"/os:10_x64,10_CO_X64")
+                    && args.contains(&"/verbose")
+                    && !args.contains(&"/uselocaltime")
+                    && !args.contains(&"/os:10_x64")
+            })
+            .once()
+            .return_once(|_, _, _, _| {
+                Ok(Output {
+                    status: ExitStatus::default(),
+                    stdout: vec![],
+                    stderr: vec![],
+                })
+            });
+
+        let task = PackageTask::new(params, &wdk_build, &command_exec, &fs);
+        assert!(task.run_inf2cat().is_ok());
+    }
+
+    #[test]
+    fn target_platform_maps_to_infverif_flag() {
+        assert_eq!(TargetPlatform::Universal.as_infverif_flag(), "/u");
+        assert_eq!(TargetPlatform::Desktop.as_infverif_flag(), "/h");
+        assert_eq!(TargetPlatform::Windows.as_infverif_flag(), "/w");
+    }
+
+    mod signtool {
+        use super::*;
+
+        // Builds a minimal `PackageTask` suitable for exercising `run_signtool_sign`
+        // in isolation. The signing method does not read `sign_mode`, so `Off` is
+        // used here; the caller passes the signtool argument slice under test
+        // directly.
+        fn create_package_task<'a>(
+            wdk_build: &'a WdkBuild,
+            command_exec: &'a CommandExec,
+            fs: &'a Fs,
+            arch: &'a CpuArchitecture,
+        ) -> PackageTask<'a> {
+            let params = PackageTaskParams {
+                package_name: "driver",
+                working_dir: Path::new("C:/abs/working"),
+                target_dir: Path::new("C:/abs/target"),
+                target_arch: arch,
+                driver_model: DriverConfig::Kmdf(KmdfConfig::default()),
+                sample_class: false,
+                sign_mode: SignMode::Off,
+                inf2cat_args: None,
+                target_platform: TargetPlatform::Universal,
+            };
+            PackageTask::new(params, wdk_build, command_exec, fs)
+        }
+
+        // Returns a mocked `CommandExec` that expects a single `signtool` invocation
+        // with exactly the provided argument vector and redaction indices.
+        fn expect_signtool_args(
+            expected: Vec<String>,
+            expected_redaction_indices: Vec<usize>,
+        ) -> CommandExec {
+            let mut command_exec = CommandExec::default();
+            command_exec
+                .expect_run_with_redaction()
+                .withf(move |command, args, redaction_indices, _env, _cwd| {
+                    command == "signtool"
+                        && args == expected
+                        && redaction_indices == expected_redaction_indices.as_slice()
+                })
+                .once()
+                .returning(|_, _, _, _, _| {
+                    Ok(Output {
+                        status: ExitStatus::default(),
+                        stdout: vec![],
+                        stderr: vec![],
+                    })
+                });
+            command_exec
+        }
+
+        #[test]
+        fn sign_with_custom_args_forwards_them_verbatim() {
+            let arch = CpuArchitecture::Amd64;
+            let command_exec = expect_signtool_args(
+                [
+                    "sign",
+                    "/fd",
+                    "SHA384",
+                    "/f",
+                    "C:/certs/my.pfx",
+                    "/p",
+                    "secret",
+                    "C:/pkg/driver.sys",
+                ]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+                vec![6],
+            );
+            let wdk_build = WdkBuild::default();
+            let fs = Fs::default();
+            let task = create_package_task(&wdk_build, &command_exec, &fs, &arch);
+
+            let signtool_args = [
+                "/fd".to_string(),
+                "SHA384".to_string(),
+                "/f".to_string(),
+                "C:/certs/my.pfx".to_string(),
+                "/p".to_string(),
+                "secret".to_string(),
+            ];
+            task.run_signtool_sign(Path::new("C:/pkg/driver.sys"), &signtool_args)
+                .expect("signing should succeed");
+        }
+
+        #[test]
+        fn sign_redacts_password_value_arg_by_redaction_index() {
+            let arch = CpuArchitecture::Amd64;
+            let command_exec = expect_signtool_args(
+                [
+                    "sign",
+                    "/f",
+                    "cert.pfx",
+                    "/p",
+                    "secret",
+                    "/fd",
+                    "SHA256",
+                    "C:/pkg/driver.sys",
+                ]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+                vec![4],
+            );
+            let wdk_build = WdkBuild::default();
+            let fs = Fs::default();
+            let task = create_package_task(&wdk_build, &command_exec, &fs, &arch);
+
+            let signtool_args = [
+                "/f".to_string(),
+                "cert.pfx".to_string(),
+                "/p".to_string(),
+                "secret".to_string(),
+                "/fd".to_string(),
+                "SHA256".to_string(),
+            ];
+            task.run_signtool_sign(Path::new("C:/pkg/driver.sys"), &signtool_args)
+                .expect("signing should succeed");
+        }
+
+        #[test]
+        fn sign_redacts_password_value_case_insensitively() {
+            let arch = CpuArchitecture::Amd64;
+            let command_exec = expect_signtool_args(
+                [
+                    "sign",
+                    "/f",
+                    "cert.pfx",
+                    "/P",
+                    "secret",
+                    "/fd",
+                    "SHA256",
+                    "C:/pkg/driver.sys",
+                ]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+                vec![4],
+            );
+            let wdk_build = WdkBuild::default();
+            let fs = Fs::default();
+            let task = create_package_task(&wdk_build, &command_exec, &fs, &arch);
+
+            let signtool_args = [
+                "/f".to_string(),
+                "cert.pfx".to_string(),
+                "/P".to_string(),
+                "secret".to_string(),
+                "/fd".to_string(),
+                "SHA256".to_string(),
+            ];
+            task.run_signtool_sign(Path::new("C:/pkg/driver.sys"), &signtool_args)
+                .expect("signing should succeed");
+        }
+
+        #[test]
+        fn sign_does_not_redact_file_operand_if_password_is_missing() {
+            let arch = CpuArchitecture::Amd64;
+            let command_exec = expect_signtool_args(
+                ["sign", "/f", "cert.pfx", "/p", "C:/pkg/driver.sys"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect(),
+                vec![],
+            );
+            let wdk_build = WdkBuild::default();
+            let fs = Fs::default();
+            let task = create_package_task(&wdk_build, &command_exec, &fs, &arch);
+
+            let signtool_args = ["/f".to_string(), "cert.pfx".to_string(), "/p".to_string()];
+            task.run_signtool_sign(Path::new("C:/pkg/driver.sys"), &signtool_args)
+                .expect("signing should succeed");
+        }
+
+        #[test]
+        fn sign_and_verify_fails_when_signtool_fails() {
+            let arch = CpuArchitecture::Amd64;
+            let mut command_exec = CommandExec::default();
+            command_exec
+                .expect_run_with_redaction()
+                .withf(|command, args, _redaction_indices, _env, _cwd| {
+                    command == "signtool" && args.first() == Some(&"sign")
+                })
+                .once()
+                .returning(|_, _, _, _, _| {
+                    Err(crate::providers::error::CommandError::CommandFailed {
+                        command: "signtool".to_string(),
+                        args: vec![],
+                        stdout: String::new(),
+                    })
+                });
+
+            let fs = Fs::default();
+
+            let wdk_build = WdkBuild::default();
+            let working_dir = PathBuf::from("C:/abs/working");
+            let target_dir = PathBuf::from("C:/abs/target");
+            let params = PackageTaskParams {
+                package_name: "driver",
+                working_dir: &working_dir,
+                target_dir: &target_dir,
+                target_arch: &arch,
+                driver_model: DriverConfig::Kmdf(KmdfConfig::default()),
+                sample_class: false,
+                sign_mode: SignMode::Test {
+                    verify_signature: false,
+                    signtool_args: vec![
+                        "/s".to_string(),
+                        "MyStore".to_string(),
+                        "/n".to_string(),
+                        "MyCert".to_string(),
+                        "/fd".to_string(),
+                        "SHA256".to_string(),
+                    ],
+                },
+                inf2cat_args: None,
+                target_platform: TargetPlatform::Universal,
+            };
+            let task = PackageTask::new(params, &wdk_build, &command_exec, &fs);
+
+            assert!(task.sign_and_verify().is_err());
+        }
+    }
+
+    fn assert_infverif_mode_flag(
+        driver_model: DriverConfig,
+        target_platform: TargetPlatform,
+        expected_mode_flag: &'static str,
+    ) {
+        let package_name = "driver";
+        let working_dir = PathBuf::from("C:/abs/driver");
+        let target_dir = PathBuf::from("C:/abs/driver/target/debug");
+        let arch = CpuArchitecture::Amd64;
+
+        let params = PackageTaskParams {
+            package_name,
+            working_dir: &working_dir,
+            target_dir: &target_dir,
+            target_arch: &arch,
+            driver_model,
+            sample_class: false,
+            sign_mode: SignMode::Off,
+            inf2cat_args: None,
+            target_platform,
+        };
+
+        let fs = Fs::default();
+        let wdk_build = WdkBuild::default();
+
+        let mut command_exec = CommandExec::default();
+        command_exec
+            .expect_run()
+            .withf(move |cmd: &str, args: &[&str], _, _| {
+                cmd == "infverif"
+                    && args.len() >= 2
+                    && args[0] == "/v"
+                    && args[1] == expected_mode_flag
+            })
+            .once()
+            .returning(|_, _, _, _| {
+                Ok(Output {
+                    status: ExitStatus::default(),
+                    stdout: vec![],
+                    stderr: vec![],
+                })
+            });
+
+        let task = PackageTask::new(params, &wdk_build, &command_exec, &fs);
+        assert!(task.run_infverif().is_ok());
+    }
+
+    #[test]
+    fn run_infverif_defaults_to_universal_for_all_driver_models() {
+        assert_infverif_mode_flag(
+            DriverConfig::Kmdf(KmdfConfig::default()),
+            TargetPlatform::Universal,
+            "/u",
+        );
+        assert_infverif_mode_flag(DriverConfig::Wdm, TargetPlatform::Universal, "/u");
+        assert_infverif_mode_flag(
+            DriverConfig::Umdf(UmdfConfig::default()),
+            TargetPlatform::Universal,
+            "/u",
+        );
+    }
+
+    #[test]
+    fn run_infverif_uses_target_platform_mode_flag() {
+        assert_infverif_mode_flag(
+            DriverConfig::Kmdf(KmdfConfig::default()),
+            TargetPlatform::Universal,
+            "/u",
+        );
+        assert_infverif_mode_flag(
+            DriverConfig::Kmdf(KmdfConfig::default()),
+            TargetPlatform::Desktop,
+            "/h",
+        );
+        assert_infverif_mode_flag(
+            DriverConfig::Kmdf(KmdfConfig::default()),
+            TargetPlatform::Windows,
+            "/w",
+        );
     }
 
     mod named_mutex {

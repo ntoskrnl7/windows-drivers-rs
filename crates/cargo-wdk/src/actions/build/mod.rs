@@ -13,8 +13,10 @@ mod package_task;
 #[cfg(test)]
 mod tests;
 use std::{
+    fmt::{self, Display},
     path::{Path, PathBuf, absolute},
     result::Result::Ok,
+    str::FromStr,
 };
 
 use anyhow::Result;
@@ -23,25 +25,64 @@ use cargo_metadata::{CrateType, Message, Metadata as CargoMetadata, Package, Tar
 use clap_cargo::Features;
 use error::BuildActionError;
 use mockall_double::double;
-pub use package_task::SignMode;
 use package_task::{PackageTask, PackageTaskParams};
+pub use package_task::{SignMode, TargetPlatform};
 use tracing::{debug, error as err, info, trace, warn};
 use wdk_build::{
     CpuArchitecture,
     metadata::{TryFromCargoMetadataError, Wdk},
 };
 
-use crate::actions::Profile;
 #[double]
 use crate::providers::{exec::CommandExec, fs::Fs, metadata::Metadata, wdk_build::WdkBuild};
+
+const X86_64_TARGET_TRIPLE_NAME: &str = "x86_64-pc-windows-msvc";
+const AARCH64_TARGET_TRIPLE_NAME: &str = "aarch64-pc-windows-msvc";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Profile {
+    Dev,
+    Release,
+}
+impl FromStr for Profile {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "dev" => Ok(Self::Dev),
+            "release" => Ok(Self::Release),
+            _ => Err(format!("'{s}' is not a valid profile")),
+        }
+    }
+}
+impl Display for Profile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            Self::Dev => "dev",
+            Self::Release => "release",
+        };
+        write!(f, "{s}")
+    }
+}
+
+/// Converts `CpuArchitecture` to its corresponding target triple name.
+#[must_use]
+pub fn to_target_triple(cpu_arch: CpuArchitecture) -> String {
+    match cpu_arch {
+        CpuArchitecture::Amd64 => X86_64_TARGET_TRIPLE_NAME.to_string(),
+        CpuArchitecture::Arm64 => AARCH64_TARGET_TRIPLE_NAME.to_string(),
+    }
+}
 
 pub struct BuildActionParams<'a> {
     pub working_dir: &'a Path,
     pub profile: Option<&'a Profile>,
     pub target_arch: Option<CpuArchitecture>,
     pub sign_mode: SignMode,
+    pub inf2cat_args: Option<Vec<String>>,
     pub is_sample_class: bool,
     pub locked: bool,
+    pub target_platform: TargetPlatform,
     pub features: &'a Features,
     pub verbosity_level: clap_verbosity_flag::Verbosity,
 }
@@ -53,8 +94,10 @@ pub struct BuildAction<'a> {
     profile: Option<&'a Profile>,
     target_arch: Option<CpuArchitecture>,
     sign_mode: SignMode,
+    inf2cat_args: Option<Vec<String>>,
     is_sample_class: bool,
     locked: bool,
+    target_platform: TargetPlatform,
     features: &'a Features,
     verbosity_level: clap_verbosity_flag::Verbosity,
 
@@ -99,9 +142,11 @@ impl<'a> BuildAction<'a> {
             working_dir: absolute(params.working_dir)?,
             profile: params.profile,
             target_arch: params.target_arch,
-            sign_mode: params.sign_mode,
+            sign_mode: params.sign_mode.clone(),
+            inf2cat_args: params.inf2cat_args.clone(),
             is_sample_class: params.is_sample_class,
             locked: params.locked,
+            target_platform: params.target_platform,
             features: params.features,
             verbosity_level: params.verbosity_level,
             wdk_build,
@@ -404,9 +449,11 @@ impl<'a> BuildAction<'a> {
                 working_dir,
                 target_dir: &target_dir,
                 target_arch: &target_arch,
-                sign_mode: self.sign_mode,
+                sign_mode: self.sign_mode.clone(),
+                inf2cat_args: self.inf2cat_args.clone(),
                 sample_class: self.is_sample_class,
                 driver_model,
+                target_platform: self.target_platform,
             },
             self.wdk_build,
             self.command_exec,
