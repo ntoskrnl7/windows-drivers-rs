@@ -12,7 +12,7 @@ driver-type = "WDM"
 [lib]
 
 [dev-dependencies]
-wdk.path = "../../crates/wdk"
+wdk = { features = ["alloc"], path = "../../crates/wdk" }
 wdk-sys = { features = ["test-stubs"], path = "../../crates/wdk-sys" }
 
 [features]

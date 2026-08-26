@@ -25,12 +25,12 @@ const EX_DEFAULT_PUSH_LOCK_FLAGS: ULONG = 0;
 
 /// Reader-writer lock backed by an executive push lock (`EX_PUSH_LOCK`).
 ///
-/// This lock is smaller than [`RwLock`](super::RwLock) and is useful for short
-/// shared/exclusive critical sections at `IRQL <= APC_LEVEL`. Push locks can
-/// wait while acquiring the lock, so they must not be used from DPC or ISR
-/// contexts. Each acquisition enters a critical region before taking the push
-/// lock and leaves it when the guard is dropped. Normal kernel APC delivery is
-/// disabled while a guard is held.
+/// This lock is smaller than the allocation-backed `RwLock` (available with the
+/// `alloc` feature) and is useful for short shared/exclusive critical sections
+/// at `IRQL <= APC_LEVEL`. Push locks can wait while acquiring the lock, so they
+/// must not be used from DPC or ISR contexts. Each acquisition enters a
+/// critical region before taking the push lock and leaves it when the guard is
+/// dropped. Normal kernel APC delivery is disabled while a guard is held.
 ///
 /// Push locks do not support recursive exclusive acquisition. Attempting to
 /// acquire the lock exclusively while it is already held by the current thread

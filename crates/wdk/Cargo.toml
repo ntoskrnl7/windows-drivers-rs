@@ -17,7 +17,7 @@ readme.workspace = true
 repository.workspace = true
 
 [features]
-# Deprecated: no longer required. Kept as a no-op for backward compatibility.
+# Enables APIs that require the kernel-mode global allocator.
 alloc = []
 nightly = ["wdk-sys/nightly"]
 
