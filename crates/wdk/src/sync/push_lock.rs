@@ -31,6 +31,8 @@ const EX_DEFAULT_PUSH_LOCK_FLAGS: ULONG = 0;
 /// must not be used from DPC or ISR contexts. Each acquisition enters a
 /// critical region before taking the push lock and leaves it when the guard is
 /// dropped. Normal kernel APC delivery is disabled while a guard is held.
+/// The inline `EX_PUSH_LOCK` storage may reside in paged or nonpaged memory, as
+/// permitted by the WDK.
 ///
 /// Push locks do not support recursive exclusive acquisition. Attempting to
 /// acquire the lock exclusively while it is already held by the current thread

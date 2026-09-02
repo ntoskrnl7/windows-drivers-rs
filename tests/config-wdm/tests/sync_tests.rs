@@ -43,6 +43,41 @@ mod tests {
     }
 
     #[test]
+    fn rw_lock_try_methods_reject_recursive_acquisition() {
+        let lock = RwLock::try_new(1_u32).expect("ERESOURCE initialization should succeed");
+
+        let read_guard = lock.read();
+        assert!(lock.try_read().is_none());
+        assert!(lock.try_write().is_none());
+        drop(read_guard);
+
+        let write_guard = lock.write();
+        assert!(lock.try_read().is_none());
+        assert!(lock.try_write().is_none());
+        drop(write_guard);
+
+        assert!(lock.try_read().is_some());
+    }
+
+    #[test]
+    #[should_panic(expected = "recursive RwLock acquisition")]
+    fn rw_lock_read_panics_on_recursive_acquisition() {
+        let lock = RwLock::try_new(1_u32).expect("ERESOURCE initialization should succeed");
+        let _write_guard = lock.write();
+
+        let _recursive_guard = lock.read();
+    }
+
+    #[test]
+    #[should_panic(expected = "recursive RwLock acquisition")]
+    fn rw_lock_write_panics_on_recursive_acquisition() {
+        let lock = RwLock::try_new(1_u32).expect("ERESOURCE initialization should succeed");
+        let _read_guard = lock.read();
+
+        let _recursive_guard = lock.write();
+    }
+
+    #[test]
     fn push_lock_read_and_write_guards_access_value() {
         let lock = PushLock::new(1_u32);
 

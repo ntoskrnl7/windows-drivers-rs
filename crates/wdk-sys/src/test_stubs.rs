@@ -38,6 +38,9 @@
 //! These stubs can be brought into scope by introducing `wdk-sys` with the
 //! `test-stubs` feature in the `dev-dependencies` of the crate's `Cargo.toml`
 
+#[cfg(any(driver_model__driver_type = "WDM", driver_model__driver_type = "KMDF"))]
+use core::sync::atomic::{AtomicU32, Ordering};
+
 #[cfg(any(driver_model__driver_type = "KMDF", driver_model__driver_type = "UMDF"))]
 pub use wdf::*;
 
@@ -71,36 +74,92 @@ pub const unsafe extern "system" fn driver_entry_stub(
 }
 
 /// Stubbed version of `ExInitializeResourceLite` so test targets can link
+///
+/// The first four bytes of the test resource storage track the number of
+/// acquisitions made through the stubs.
+///
+/// # Safety
+///
+/// `resource` must point to valid writable `ERESOURCE` storage.
 #[cfg(any(driver_model__driver_type = "WDM", driver_model__driver_type = "KMDF"))]
 #[unsafe(no_mangle)]
-pub extern "system" fn ExInitializeResourceLite(_resource: *mut ERESOURCE) -> NTSTATUS {
+pub unsafe extern "system" fn ExInitializeResourceLite(resource: *mut ERESOURCE) -> NTSTATUS {
+    // SAFETY: Test callers pass writable, properly aligned `ERESOURCE` storage,
+    // which is large enough to hold the test-only acquisition counter.
+    unsafe {
+        resource.cast::<AtomicU32>().write(AtomicU32::new(0));
+    }
     crate::STATUS_SUCCESS
 }
 
 /// Stubbed version of `ExAcquireResourceSharedLite` so test targets can link
+///
+/// # Safety
+///
+/// `resource` must point to an initialized `ERESOURCE`.
 #[cfg(any(driver_model__driver_type = "WDM", driver_model__driver_type = "KMDF"))]
 #[unsafe(no_mangle)]
-pub extern "system" fn ExAcquireResourceSharedLite(
-    _resource: *mut ERESOURCE,
+pub unsafe extern "system" fn ExAcquireResourceSharedLite(
+    resource: *mut ERESOURCE,
     _wait: crate::BOOLEAN,
 ) -> crate::BOOLEAN {
+    // SAFETY: `ExInitializeResourceLite` initialized the test-only counter in
+    // this valid `ERESOURCE` storage.
+    unsafe {
+        let _previous_count =
+            (*resource.cast::<AtomicU32>()).fetch_add(1, Ordering::Relaxed);
+    }
     1
 }
 
 /// Stubbed version of `ExAcquireResourceExclusiveLite` so test targets can link
+///
+/// # Safety
+///
+/// `resource` must point to an initialized `ERESOURCE`.
 #[cfg(any(driver_model__driver_type = "WDM", driver_model__driver_type = "KMDF"))]
 #[unsafe(no_mangle)]
-pub extern "system" fn ExAcquireResourceExclusiveLite(
-    _resource: *mut ERESOURCE,
+pub unsafe extern "system" fn ExAcquireResourceExclusiveLite(
+    resource: *mut ERESOURCE,
     _wait: crate::BOOLEAN,
 ) -> crate::BOOLEAN {
+    // SAFETY: `ExInitializeResourceLite` initialized the test-only counter in
+    // this valid `ERESOURCE` storage.
+    unsafe {
+        let _previous_count =
+            (*resource.cast::<AtomicU32>()).fetch_add(1, Ordering::Relaxed);
+    }
     1
 }
 
-/// Stubbed version of `ExReleaseResourceLite` so test targets can link
+/// Stubbed version of `ExIsResourceAcquiredSharedLite` so test targets can link
+///
+/// # Safety
+///
+/// `resource` must point to an initialized `ERESOURCE`.
 #[cfg(any(driver_model__driver_type = "WDM", driver_model__driver_type = "KMDF"))]
 #[unsafe(no_mangle)]
-pub extern "system" fn ExReleaseResourceLite(_resource: *mut ERESOURCE) {}
+pub unsafe extern "system" fn ExIsResourceAcquiredSharedLite(resource: *mut ERESOURCE) -> ULONG {
+    // SAFETY: `ExInitializeResourceLite` initialized the test-only counter in
+    // this valid `ERESOURCE` storage.
+    unsafe { (*resource.cast::<AtomicU32>()).load(Ordering::Relaxed) }
+}
+
+/// Stubbed version of `ExReleaseResourceLite` so test targets can link
+///
+/// # Safety
+///
+/// `resource` must point to an initialized and acquired `ERESOURCE`.
+#[cfg(any(driver_model__driver_type = "WDM", driver_model__driver_type = "KMDF"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn ExReleaseResourceLite(resource: *mut ERESOURCE) {
+    // SAFETY: `ExInitializeResourceLite` initialized the test-only counter in
+    // this valid `ERESOURCE` storage, and guards release one acquisition.
+    unsafe {
+        let _previous_count =
+            (*resource.cast::<AtomicU32>()).fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 /// Stubbed version of `ExDeleteResourceLite` so test targets can link
 #[cfg(any(driver_model__driver_type = "WDM", driver_model__driver_type = "KMDF"))]

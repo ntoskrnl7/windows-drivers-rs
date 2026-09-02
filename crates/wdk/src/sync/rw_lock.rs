@@ -17,6 +17,7 @@ use wdk_sys::{
         ExAcquireResourceSharedLite,
         ExDeleteResourceLite,
         ExInitializeResourceLite,
+        ExIsResourceAcquiredSharedLite,
         ExReleaseResourceLite,
         KeEnterCriticalRegion,
         KeLeaveCriticalRegion,
@@ -34,7 +35,13 @@ use crate::nt_success;
 ///
 /// The backing `ERESOURCE` is allocated separately through the configured
 /// global allocator so its kernel object address stays stable for the lifetime
-/// of the lock.
+/// of the lock. The global allocator must allocate from nonpaged pool because
+/// the WDK requires `ERESOURCE` storage to remain resident. The
+/// `wdk_alloc::WdkAllocator` type satisfies this requirement.
+///
+/// Recursive acquisition is rejected because creating another guard on the
+/// same thread could violate Rust's reference aliasing rules, even though
+/// `ERESOURCE` itself permits some recursive acquisitions.
 pub struct RwLock<T: ?Sized> {
     resource: NonNull<ERESOURCE>,
     value: UnsafeCell<T>,
@@ -58,6 +65,11 @@ impl<T> RwLock<T> {
     /// initialize the underlying `ERESOURCE`, or
     /// [`STATUS_INSUFFICIENT_RESOURCES`] if the backing resource allocation
     /// fails.
+    ///
+    /// # Allocator requirements
+    ///
+    /// The configured global allocator must allocate from nonpaged pool. The
+    /// `wdk_alloc::WdkAllocator` type satisfies this requirement.
     pub fn try_new(value: T) -> Result<Self, NTSTATUS> {
         let resource = allocate_resource()?;
 
@@ -85,10 +97,14 @@ impl<T> RwLock<T> {
 
 impl<T: ?Sized> RwLock<T> {
     /// Lock this `RwLock` with shared read access.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the current thread already holds this lock.
     #[must_use]
     pub fn read(&self) -> RwLockReadGuard<'_, T> {
         let acquired = self.acquire_shared(true);
-        assert!(acquired);
+        assert!(acquired, "recursive RwLock acquisition");
 
         RwLockReadGuard {
             lock: self,
@@ -97,6 +113,9 @@ impl<T: ?Sized> RwLock<T> {
     }
 
     /// Try to lock this `RwLock` with shared read access without waiting.
+    ///
+    /// Returns `None` if the current thread already holds this lock or shared
+    /// access cannot be acquired immediately.
     #[must_use]
     pub fn try_read(&self) -> Option<RwLockReadGuard<'_, T>> {
         self.acquire_shared(false).then_some(RwLockReadGuard {
@@ -106,10 +125,14 @@ impl<T: ?Sized> RwLock<T> {
     }
 
     /// Lock this `RwLock` with exclusive write access.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the current thread already holds this lock.
     #[must_use]
     pub fn write(&self) -> RwLockWriteGuard<'_, T> {
         let acquired = self.acquire_exclusive(true);
-        assert!(acquired);
+        assert!(acquired, "recursive RwLock acquisition");
 
         RwLockWriteGuard {
             lock: self,
@@ -118,6 +141,9 @@ impl<T: ?Sized> RwLock<T> {
     }
 
     /// Try to lock this `RwLock` with exclusive write access without waiting.
+    ///
+    /// Returns `None` if the current thread already holds this lock or
+    /// exclusive access cannot be acquired immediately.
     #[must_use]
     pub fn try_write(&self) -> Option<RwLockWriteGuard<'_, T>> {
         self.acquire_exclusive(false).then_some(RwLockWriteGuard {
@@ -141,6 +167,11 @@ impl<T: ?Sized> RwLock<T> {
     fn acquire_shared(&self, wait: bool) -> bool {
         self.enter_critical_region();
 
+        if self.is_owned_by_current_thread() {
+            self.leave_critical_region();
+            return false;
+        }
+
         let acquired;
         // SAFETY: `resource_ptr` returns the initialized `ERESOURCE` owned by
         // this lock. The caller is at `IRQL <= APC_LEVEL`, and the critical
@@ -159,6 +190,11 @@ impl<T: ?Sized> RwLock<T> {
     fn acquire_exclusive(&self, wait: bool) -> bool {
         self.enter_critical_region();
 
+        if self.is_owned_by_current_thread() {
+            self.leave_critical_region();
+            return false;
+        }
+
         let acquired;
         // SAFETY: `resource_ptr` returns the initialized `ERESOURCE` owned by
         // this lock. The caller is at `IRQL <= APC_LEVEL`, and the critical
@@ -172,6 +208,13 @@ impl<T: ?Sized> RwLock<T> {
         }
 
         acquired != 0
+    }
+
+    fn is_owned_by_current_thread(&self) -> bool {
+        // SAFETY: `resource_ptr` returns the initialized `ERESOURCE` owned by
+        // this lock. The caller is at `IRQL <= APC_LEVEL`, within the routine's
+        // `IRQL <= DISPATCH_LEVEL` contract.
+        unsafe { ExIsResourceAcquiredSharedLite(self.resource_ptr()) != 0 }
     }
 
     fn release(&self) {
