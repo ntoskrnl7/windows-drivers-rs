@@ -123,7 +123,7 @@ impl<T: ?Sized> RwLock<T> {
     /// access cannot be acquired immediately.
     #[must_use]
     pub fn try_read(&self) -> Option<RwLockReadGuard<'_, T>> {
-        self.acquire_shared(false).then_some(RwLockReadGuard {
+        self.acquire_shared(false).then(|| RwLockReadGuard {
             lock: self,
             _not_send: super::not_send(),
         })
@@ -151,7 +151,7 @@ impl<T: ?Sized> RwLock<T> {
     /// exclusive access cannot be acquired immediately.
     #[must_use]
     pub fn try_write(&self) -> Option<RwLockWriteGuard<'_, T>> {
-        self.acquire_exclusive(false).then_some(RwLockWriteGuard {
+        self.acquire_exclusive(false).then(|| RwLockWriteGuard {
             lock: self,
             _not_send: super::not_send(),
         })

@@ -34,10 +34,11 @@ const EX_DEFAULT_PUSH_LOCK_FLAGS: ULONG = 0;
 /// The inline `EX_PUSH_LOCK` storage may reside in paged or nonpaged memory, as
 /// permitted by the WDK.
 ///
-/// Push locks do not support recursive exclusive acquisition. Attempting to
-/// acquire the lock exclusively while it is already held by the current thread
-/// can hang the system. Each successful acquisition must be released by
-/// dropping the returned guard.
+/// Push locks do not support recursive acquisition. Exclusive acquisition
+/// hangs if the current thread already holds either shared or exclusive access.
+/// A repeated shared acquisition can also hang when an exclusive waiter is
+/// queued, so callers must not attempt to reacquire this lock in any mode. Each
+/// successful acquisition must be released by dropping the returned guard.
 ///
 /// This wrapper uses the modern `ExAcquirePushLock*Ex` bindings generated from
 /// the active WDK configuration.

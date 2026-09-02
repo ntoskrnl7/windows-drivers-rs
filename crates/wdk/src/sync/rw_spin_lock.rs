@@ -93,8 +93,9 @@ impl<T: ?Sized> RwSpinLock<T> {
     ///
     /// # Safety
     ///
-    /// The caller must already be running at `DISPATCH_LEVEL`. The returned
-    /// guard will not restore IRQL when it is dropped.
+    /// The caller must already be running at `DISPATCH_LEVEL` and must remain
+    /// at that IRQL until the returned guard is dropped. The guard will not
+    /// restore IRQL when it is dropped.
     #[must_use]
     pub unsafe fn read_at_dpc_level(&self) -> RwSpinLockReadGuard<'_, T> {
         // SAFETY: The caller guarantees current IRQL is `DISPATCH_LEVEL`, and
@@ -135,8 +136,9 @@ impl<T: ?Sized> RwSpinLock<T> {
     ///
     /// # Safety
     ///
-    /// The caller must already be running at `DISPATCH_LEVEL`. The returned
-    /// guard will not restore IRQL when it is dropped.
+    /// The caller must already be running at `DISPATCH_LEVEL` and must remain
+    /// at that IRQL until the returned guard is dropped. The guard will not
+    /// restore IRQL when it is dropped.
     #[must_use]
     pub unsafe fn write_at_dpc_level(&self) -> RwSpinLockWriteGuard<'_, T> {
         // SAFETY: The caller guarantees current IRQL is `DISPATCH_LEVEL`, and
