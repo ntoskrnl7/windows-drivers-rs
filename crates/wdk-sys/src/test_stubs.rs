@@ -1,6 +1,8 @@
 // Copyright (c) Microsoft Corporation
 // License: MIT OR Apache-2.0
 
+#![allow(non_snake_case)]
+
 //! Any library dependency that depends on `wdk-sys` requires these stubs to
 //! provide symbols to successfully compile and run tests.
 //!
