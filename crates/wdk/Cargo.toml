@@ -17,9 +17,11 @@ readme.workspace = true
 repository.workspace = true
 
 [features]
-# Enables APIs that require the kernel-mode global allocator.
+# Deprecated: no longer required. Kept as a no-op for backward compatibility.
 alloc = []
 nightly = ["wdk-sys/nightly"]
+# Enables the allocation-backed `sync::RwLock` API.
+rw-lock = []
 
 [dependencies]
 cfg-if.workspace = true

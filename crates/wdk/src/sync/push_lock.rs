@@ -26,7 +26,7 @@ const EX_DEFAULT_PUSH_LOCK_FLAGS: ULONG = 0;
 /// Reader-writer lock backed by an executive push lock (`EX_PUSH_LOCK`).
 ///
 /// This lock is smaller than the allocation-backed `RwLock` (available with the
-/// `alloc` feature) and is useful for short shared/exclusive critical sections
+/// `rw-lock` feature) and is useful for short shared/exclusive critical sections
 /// at `IRQL <= APC_LEVEL`. Push locks can wait while acquiring the lock, so they
 /// must not be used from DPC or ISR contexts. Each acquisition enters a
 /// critical region before taking the push lock and leaves it when the guard is

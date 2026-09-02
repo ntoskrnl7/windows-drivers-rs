@@ -20,7 +20,7 @@ crate-type = ["cdylib"]
 wdk-build.path = "../../crates/wdk-build"
 
 [dependencies]
-wdk = { features = ["alloc"], path = "../../crates/wdk" }
+wdk = { features = ["rw-lock"], path = "../../crates/wdk" }
 wdk-alloc.path = "../../crates/wdk-alloc"
 wdk-panic.path = "../../crates/wdk-panic"
 wdk-sys.path = "../../crates/wdk-sys"

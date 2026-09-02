@@ -4,19 +4,19 @@
 //! shared/exclusive kernel locks:
 //!
 //! - `RwLock` uses `ERESOURCE` for waitable reader-writer locking at `IRQL <=
-//!   APC_LEVEL` and is available with the `alloc` feature.
+//!   APC_LEVEL` and is available with the `rw-lock` feature.
 //! - [`PushLock`] uses `EX_PUSH_LOCK` for compact waitable reader-writer
 //!   locking at `IRQL <= APC_LEVEL`.
 //! - [`RwSpinLock`] uses `EX_SPIN_LOCK` for very short non-waiting sections
 //!   that can run up to `DISPATCH_LEVEL`.
 
 pub use push_lock::*;
-#[cfg(feature = "alloc")]
+#[cfg(feature = "rw-lock")]
 pub use rw_lock::*;
 pub use rw_spin_lock::*;
 
 mod push_lock;
-#[cfg(feature = "alloc")]
+#[cfg(feature = "rw-lock")]
 mod rw_lock;
 mod rw_spin_lock;
 

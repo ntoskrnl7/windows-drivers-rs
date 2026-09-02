@@ -11,7 +11,7 @@
 )]
 
 #[cfg(all(
-    feature = "alloc",
+    feature = "rw-lock",
     any(driver_model__driver_type = "WDM", driver_model__driver_type = "KMDF")
 ))]
 extern crate alloc;
