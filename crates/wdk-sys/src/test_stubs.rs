@@ -55,6 +55,67 @@ use crate::{NTSTATUS, PCUNICODE_STRING, PDRIVER_OBJECT};
 #[cfg(any(driver_model__driver_type = "WDM", driver_model__driver_type = "KMDF"))]
 use crate::{ERESOURCE, EX_SPIN_LOCK, KIRQL, LOGICAL, ULONG, ULONG_PTR};
 
+#[cfg(any(driver_model__driver_type = "WDM", driver_model__driver_type = "KMDF"))]
+mod spin_lock_test_state {
+    use super::{AtomicU32, KIRQL, Ordering, ULONG};
+
+    pub(super) const TEST_OLD_IRQL: KIRQL = 0x5a;
+
+    pub(super) const SHARED_ACQUIRE: ULONG = 1 << 0;
+    pub(super) const SHARED_RELEASE: ULONG = 1 << 1;
+    pub(super) const SHARED_OLD_IRQL: ULONG = 1 << 2;
+    pub(super) const SHARED_DPC_ACQUIRE: ULONG = 1 << 3;
+    pub(super) const SHARED_DPC_RELEASE: ULONG = 1 << 4;
+    pub(super) const EXCLUSIVE_ACQUIRE: ULONG = 1 << 5;
+    pub(super) const EXCLUSIVE_RELEASE: ULONG = 1 << 6;
+    pub(super) const EXCLUSIVE_OLD_IRQL: ULONG = 1 << 7;
+    pub(super) const EXCLUSIVE_DPC_ACQUIRE: ULONG = 1 << 8;
+    pub(super) const EXCLUSIVE_DPC_RELEASE: ULONG = 1 << 9;
+
+    /// Expected events for a normal shared spin-lock acquire/release pair.
+    pub const SPIN_LOCK_SHARED_EVENTS: ULONG =
+        SHARED_ACQUIRE | SHARED_RELEASE | SHARED_OLD_IRQL;
+
+    /// Expected events for a DPC-level shared spin-lock acquire/release pair.
+    pub const SPIN_LOCK_SHARED_AT_DPC_LEVEL_EVENTS: ULONG =
+        SHARED_DPC_ACQUIRE | SHARED_DPC_RELEASE;
+
+    /// Expected events for a normal exclusive spin-lock acquire/release pair.
+    pub const SPIN_LOCK_EXCLUSIVE_EVENTS: ULONG =
+        EXCLUSIVE_ACQUIRE | EXCLUSIVE_RELEASE | EXCLUSIVE_OLD_IRQL;
+
+    /// Expected events for a DPC-level exclusive spin-lock acquire/release pair.
+    pub const SPIN_LOCK_EXCLUSIVE_AT_DPC_LEVEL_EVENTS: ULONG =
+        EXCLUSIVE_DPC_ACQUIRE | EXCLUSIVE_DPC_RELEASE;
+
+    static SPIN_LOCK_EVENTS: AtomicU32 = AtomicU32::new(0);
+
+    pub(super) fn record(events: ULONG) {
+        let _previous_events = SPIN_LOCK_EVENTS.fetch_or(events, Ordering::Relaxed);
+    }
+
+    /// Clear the spin-lock events recorded by the test stubs.
+    pub fn reset_spin_lock_events() {
+        SPIN_LOCK_EVENTS.store(0, Ordering::Relaxed);
+    }
+
+    /// Return the spin-lock events recorded by the test stubs.
+    #[must_use]
+    pub fn spin_lock_events() -> ULONG {
+        SPIN_LOCK_EVENTS.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(any(driver_model__driver_type = "WDM", driver_model__driver_type = "KMDF"))]
+pub use spin_lock_test_state::{
+    SPIN_LOCK_EXCLUSIVE_AT_DPC_LEVEL_EVENTS,
+    SPIN_LOCK_EXCLUSIVE_EVENTS,
+    SPIN_LOCK_SHARED_AT_DPC_LEVEL_EVENTS,
+    SPIN_LOCK_SHARED_EVENTS,
+    reset_spin_lock_events,
+    spin_lock_events,
+};
+
 /// Stubbed version of `DriverEntry` Symbol so that test targets will compile
 ///
 /// # Safety
@@ -218,49 +279,71 @@ pub extern "system" fn ExReleasePushLockExclusiveEx(_push_lock: *mut ULONG_PTR, 
 #[cfg(any(driver_model__driver_type = "WDM", driver_model__driver_type = "KMDF"))]
 #[unsafe(no_mangle)]
 pub extern "system" fn ExAcquireSpinLockShared(_spin_lock: *mut EX_SPIN_LOCK) -> KIRQL {
-    0
+    spin_lock_test_state::record(spin_lock_test_state::SHARED_ACQUIRE);
+    spin_lock_test_state::TEST_OLD_IRQL
 }
 
 /// Stubbed version of `ExAcquireSpinLockSharedAtDpcLevel` so test targets can
 /// link
 #[cfg(any(driver_model__driver_type = "WDM", driver_model__driver_type = "KMDF"))]
 #[unsafe(no_mangle)]
-pub extern "system" fn ExAcquireSpinLockSharedAtDpcLevel(_spin_lock: *mut EX_SPIN_LOCK) {}
+pub extern "system" fn ExAcquireSpinLockSharedAtDpcLevel(_spin_lock: *mut EX_SPIN_LOCK) {
+    spin_lock_test_state::record(spin_lock_test_state::SHARED_DPC_ACQUIRE);
+}
 
 /// Stubbed version of `ExReleaseSpinLockShared` so test targets can link
 #[cfg(any(driver_model__driver_type = "WDM", driver_model__driver_type = "KMDF"))]
 #[unsafe(no_mangle)]
-pub extern "system" fn ExReleaseSpinLockShared(_spin_lock: *mut EX_SPIN_LOCK, _old_irql: KIRQL) {}
+pub extern "system" fn ExReleaseSpinLockShared(_spin_lock: *mut EX_SPIN_LOCK, old_irql: KIRQL) {
+    let mut events = spin_lock_test_state::SHARED_RELEASE;
+    if old_irql == spin_lock_test_state::TEST_OLD_IRQL {
+        events |= spin_lock_test_state::SHARED_OLD_IRQL;
+    }
+    spin_lock_test_state::record(events);
+}
 
 /// Stubbed version of `ExReleaseSpinLockSharedFromDpcLevel` so test targets can
 /// link
 #[cfg(any(driver_model__driver_type = "WDM", driver_model__driver_type = "KMDF"))]
 #[unsafe(no_mangle)]
-pub extern "system" fn ExReleaseSpinLockSharedFromDpcLevel(_spin_lock: *mut EX_SPIN_LOCK) {}
+pub extern "system" fn ExReleaseSpinLockSharedFromDpcLevel(_spin_lock: *mut EX_SPIN_LOCK) {
+    spin_lock_test_state::record(spin_lock_test_state::SHARED_DPC_RELEASE);
+}
 
 /// Stubbed version of `ExAcquireSpinLockExclusive` so test targets can link
 #[cfg(any(driver_model__driver_type = "WDM", driver_model__driver_type = "KMDF"))]
 #[unsafe(no_mangle)]
 pub extern "system" fn ExAcquireSpinLockExclusive(_spin_lock: *mut EX_SPIN_LOCK) -> KIRQL {
-    0
+    spin_lock_test_state::record(spin_lock_test_state::EXCLUSIVE_ACQUIRE);
+    spin_lock_test_state::TEST_OLD_IRQL
 }
 
 /// Stubbed version of `ExAcquireSpinLockExclusiveAtDpcLevel` so test targets
 /// can link
 #[cfg(any(driver_model__driver_type = "WDM", driver_model__driver_type = "KMDF"))]
 #[unsafe(no_mangle)]
-pub extern "system" fn ExAcquireSpinLockExclusiveAtDpcLevel(_spin_lock: *mut EX_SPIN_LOCK) {}
+pub extern "system" fn ExAcquireSpinLockExclusiveAtDpcLevel(_spin_lock: *mut EX_SPIN_LOCK) {
+    spin_lock_test_state::record(spin_lock_test_state::EXCLUSIVE_DPC_ACQUIRE);
+}
 
 /// Stubbed version of `ExReleaseSpinLockExclusive` so test targets can link
 #[cfg(any(driver_model__driver_type = "WDM", driver_model__driver_type = "KMDF"))]
 #[unsafe(no_mangle)]
-pub extern "system" fn ExReleaseSpinLockExclusive(_spin_lock: *mut EX_SPIN_LOCK, _old_irql: KIRQL) {}
+pub extern "system" fn ExReleaseSpinLockExclusive(_spin_lock: *mut EX_SPIN_LOCK, old_irql: KIRQL) {
+    let mut events = spin_lock_test_state::EXCLUSIVE_RELEASE;
+    if old_irql == spin_lock_test_state::TEST_OLD_IRQL {
+        events |= spin_lock_test_state::EXCLUSIVE_OLD_IRQL;
+    }
+    spin_lock_test_state::record(events);
+}
 
 /// Stubbed version of `ExReleaseSpinLockExclusiveFromDpcLevel` so test targets
 /// can link
 #[cfg(any(driver_model__driver_type = "WDM", driver_model__driver_type = "KMDF"))]
 #[unsafe(no_mangle)]
-pub extern "system" fn ExReleaseSpinLockExclusiveFromDpcLevel(_spin_lock: *mut EX_SPIN_LOCK) {}
+pub extern "system" fn ExReleaseSpinLockExclusiveFromDpcLevel(_spin_lock: *mut EX_SPIN_LOCK) {
+    spin_lock_test_state::record(spin_lock_test_state::EXCLUSIVE_DPC_RELEASE);
+}
 
 /// Stubbed version of `ExTryConvertSharedSpinLockExclusive` so test targets can
 /// link

@@ -3,9 +3,25 @@
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Mutex, MutexGuard};
+
     use wdk::sync::{PushLock, RwLock, RwSpinLock};
-    #[allow(unused_imports)]
-    use wdk_sys::test_stubs as _;
+    use wdk_sys::test_stubs::{
+        SPIN_LOCK_EXCLUSIVE_AT_DPC_LEVEL_EVENTS,
+        SPIN_LOCK_EXCLUSIVE_EVENTS,
+        SPIN_LOCK_SHARED_AT_DPC_LEVEL_EVENTS,
+        SPIN_LOCK_SHARED_EVENTS,
+        reset_spin_lock_events,
+        spin_lock_events,
+    };
+
+    static SPIN_LOCK_STUBS: Mutex<()> = Mutex::new(());
+
+    fn lock_spin_lock_stubs() -> MutexGuard<'static, ()> {
+        SPIN_LOCK_STUBS
+            .lock()
+            .expect("spin-lock stub mutex should not be poisoned")
+    }
 
     #[test]
     fn rw_lock_read_and_write_guards_access_value() {
@@ -102,43 +118,66 @@ mod tests {
 
     #[test]
     fn rw_spin_lock_read_and_write_guards_access_value() {
+        let _stub_guard = lock_spin_lock_stubs();
         let lock = RwSpinLock::new(1_u32);
 
+        reset_spin_lock_events();
         assert_eq!(*lock.read(), 1);
+        assert_eq!(spin_lock_events(), SPIN_LOCK_SHARED_EVENTS);
 
+        reset_spin_lock_events();
         {
             let mut value = lock.write();
             *value = 5;
         }
+        assert_eq!(spin_lock_events(), SPIN_LOCK_EXCLUSIVE_EVENTS);
 
+        reset_spin_lock_events();
         assert_eq!(*lock.read(), 5);
+        assert_eq!(spin_lock_events(), SPIN_LOCK_SHARED_EVENTS);
     }
 
     #[test]
     fn rw_spin_lock_get_mut_accesses_value_without_locking() {
+        let _stub_guard = lock_spin_lock_stubs();
         let mut lock = RwSpinLock::new(1_u32);
 
         *lock.get_mut() = 11;
 
+        reset_spin_lock_events();
         assert_eq!(*lock.read(), 11);
+        assert_eq!(spin_lock_events(), SPIN_LOCK_SHARED_EVENTS);
     }
 
     #[test]
     fn rw_spin_lock_dpc_level_guards_access_value() {
+        let _stub_guard = lock_spin_lock_stubs();
         let lock = RwSpinLock::new(1_u32);
 
+        reset_spin_lock_events();
         // SAFETY: The test stubs do not inspect or modify IRQL, so they model
         // the caller already running at DISPATCH_LEVEL.
         let value = unsafe { lock.read_at_dpc_level() };
         assert_eq!(*value, 1);
         drop(value);
+        assert_eq!(
+            spin_lock_events(),
+            SPIN_LOCK_SHARED_AT_DPC_LEVEL_EVENTS
+        );
 
+        reset_spin_lock_events();
         // SAFETY: The test stubs do not inspect or modify IRQL, so they model
         // the caller already running at DISPATCH_LEVEL.
         let mut value = unsafe { lock.write_at_dpc_level() };
         *value = 13;
         drop(value);
+        assert_eq!(
+            spin_lock_events(),
+            SPIN_LOCK_EXCLUSIVE_AT_DPC_LEVEL_EVENTS
+        );
 
+        reset_spin_lock_events();
         assert_eq!(*lock.read(), 13);
+        assert_eq!(spin_lock_events(), SPIN_LOCK_SHARED_EVENTS);
     }
 }
