@@ -28,10 +28,11 @@ use crate::nt_success;
 
 /// Reader-writer lock backed by an executive resource (`ERESOURCE`).
 ///
-/// The lock can be acquired at `IRQL <= APC_LEVEL`. The underlying executive
-/// resource is initialized by [`RwLock::try_new`] and deleted when the lock is
-/// dropped. Each successful acquisition enters a critical region before taking
-/// the resource and leaves it when the guard is dropped.
+/// The underlying executive resource can be initialized by [`RwLock::try_new`]
+/// at `IRQL <= DISPATCH_LEVEL`. The lock can be acquired and must be dropped at
+/// `IRQL <= APC_LEVEL`; in particular, it must not be destroyed from a DPC or
+/// interrupt context. Each successful acquisition enters a critical region
+/// before taking the resource and leaves it when the guard is dropped.
 ///
 /// The backing `ERESOURCE` is allocated separately through the configured
 /// global allocator so its kernel object address stays stable for the lifetime
@@ -70,6 +71,10 @@ impl<T> RwLock<T> {
     ///
     /// The configured global allocator must allocate from nonpaged pool. The
     /// `wdk_alloc::WdkAllocator` type satisfies this requirement.
+    ///
+    /// # IRQL requirements
+    ///
+    /// The caller must be running at `IRQL <= DISPATCH_LEVEL`.
     pub fn try_new(value: T) -> Result<Self, NTSTATUS> {
         let resource = allocate_resource()?;
 
@@ -246,7 +251,8 @@ impl<T: ?Sized> RwLock<T> {
 impl<T: ?Sized> Drop for RwLock<T> {
     fn drop(&mut self) {
         // SAFETY: The resource was initialized by `try_new`, is owned by this
-        // `RwLock`, and no guards can outlive `self`.
+        // `RwLock`, no guards can outlive `self`, and the type-level contract
+        // requires destruction at `IRQL <= APC_LEVEL`.
         let status = unsafe { ExDeleteResourceLite(self.resource.as_ptr()) };
 
         // Only free the backing allocation if the kernel successfully tore down
